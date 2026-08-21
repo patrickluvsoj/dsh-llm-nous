@@ -1,0 +1,13 @@
+# Nous Portal adapter bundle. The adapter owns provider route `nous`; the
+# default model row is overridden so newly-created agents use the Nous route.
+- insert:
+    - id: llm-nous
+      name: dsh-llm-nous
+      config:
+        apiKeyEnv: NOUS_API_KEY
+        baseURL: https://inference-api.nousresearch.com/v1
+
+- id: agent-default-model
+  config:
+    provider: nous
+    model: deepseek/deepseek-v4-flash-0731

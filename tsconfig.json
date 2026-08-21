@@ -1,0 +1,10 @@
+{
+  "extends": "../deepseek-harness/tsconfig.base.json",
+  "compilerOptions": {
+    "rootDir": "src",
+    "outDir": "lib",
+    "declarationMap": false,
+    "sourceMap": false
+  },
+  "include": ["src"]
+}
