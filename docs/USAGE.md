@@ -98,15 +98,25 @@ The bundle registers the `nous` provider and makes its default model available t
 
 ## 4. Choose a model
 
-The bundle's default model is:
+### Web dashboard
+
+Open **Settings → Models**. The Nous provider and its advertised models appear in the Harness model picker after the bundle loads. Select a model there to make it the default for new sessions. Existing sessions keep the provider/model recorded in their own log.
+
+![Harness model settings page](assets/providers-models-page.png)
+
+This screenshot is the upstream Harness model-settings UI; the Nous entries appear after the bundle is installed.
+
+The plugin advertises these entries by default:
 
 ```text
 deepseek/deepseek-v4-flash-0731
+deepseek/deepseek-v4-pro-0813
+stepfun/step-3.7-flash:free
 ```
 
-That is a paid model. Your Nous Portal account must have available credits.
+### Terminal and headless runs
 
-To use a different model, create a patch file:
+There is no separate plugin-specific terminal picker. Select the model through a normal Harness patch:
 
 ```yaml
 - id: agent-default-model
@@ -115,13 +125,13 @@ To use a different model, create a patch file:
     model: stepfun/step-3.7-flash:free
 ```
 
-Run it:
+Then run:
 
 ```sh
-dsh --profile web --patch ./nous-model.cordis.yml
+dsh --profile headless --patch ./nous-model.cordis.yml 'Reply with exactly: NOUS_OK'
 ```
 
-The model selector may also expose the bundle's advertised catalog entries. Any exact Nous model ID can pass through even if it is not listed in the small default catalog.
+Any exact Nous model ID can be used this way, even if it is not in the small advertised catalog.
 
 ## 5. Set the output budget
 
