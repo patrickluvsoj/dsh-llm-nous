@@ -97,7 +97,6 @@ With the current Harness composer picker, the live Nous catalog is no longer squ
 - keep favorites profile-wide, so pinned models stay at the top across sessions and after restarting Harness;
 - keep the current model visible even if Nous later removes it from the advertised catalog.
 
-Search appears automatically when the available catalog is larger than the compact view. Pins are a UI preference stored by Harness; they do not rewrite the plugin's configured `models` fallback.
 
 ![Search all Nous Portal models and pin favorites](docs/assets/nous-model-search-and-pins.gif)
 
