@@ -71,10 +71,10 @@ The bundle defaults new sessions to:
 deepseek/deepseek-v4-flash-0731
 ```
 
-That model is paid and requires available Nous Portal credits. The bundle also advertises this free model for testing:
+That model is paid and requires available Nous Portal credits. The bundle also advertises this free model from the usage-ranked catalog:
 
 ```text
-stepfun/step-3.7-flash:free
+poolside/laguna-s-2.1:free
 ```
 
 ## Choose a model
@@ -89,15 +89,49 @@ Harness exposes configured providers in **Settings → Models**. After `dsh-llm-
 
 Select a model in the picker and it becomes the default for **new sessions**. A session that has already sent a request keeps the provider/model recorded in its own log. Model changes apply on the next request; no server restart is needed for an ordinary selection change.
 
-The plugin advertises these picker-friendly entries by default:
+### Search the full Nous catalog and pin favorites
+
+With the current Harness composer picker, the live Nous catalog is no longer squeezed into one heroic dropdown. The picker keeps the first 12 models from each provider compact, then lets you:
+
+- search every compatible model returned by Nous Portal, across provider name, model name, exact model ID, and description;
+- expand a provider to browse its complete catalog without searching;
+- pin or unpin an exact Nous model with the star action beside the model;
+- keep favorites profile-wide, so pinned models stay at the top across sessions and after restarting Harness;
+- keep the current model visible even if Nous later removes it from the advertised catalog.
+
+Search appears automatically when the available catalog is larger than the compact view. Pins are a UI preference stored by Harness; they do not rewrite the plugin's configured `models` fallback.
+
+![Search all Nous Portal models and pin favorites](docs/assets/nous-model-search-and-pins.gif)
+
+Live discovery is the default (`catalogMode: live`). The plugin makes an authenticated `GET /models` request to the configured Nous endpoint and merges compatible live routes into the picker. These twelve curated routes stay pinned first, preserving their OpenRouter trailing-week usage rank:
 
 ```text
 deepseek/deepseek-v4-flash-0731
-deepseek/deepseek-v4-pro-0813
-stepfun/step-3.7-flash:free
+xiaomi/mimo-v2.5
+tencent/hy3
+deepseek/deepseek-v4-flash
+openai/gpt-5.6-luna
+z-ai/glm-5.2
+google/gemini-3.7-flash
+deepseek/deepseek-v4-pro
+minimax/minimax-m3
+poolside/laguna-s-2.1:free
+anthropic/claude-opus-5
+openai/gpt-5.6-sol
 ```
 
-The Nous catalog is much larger. A model ID that is not in this small advertised list can still be used by setting it explicitly.
+The ranking measures adoption by prompt-plus-completion token volume, not model quality. OpenRouter-only routes and variants absent from Nous are skipped. Source and attribution: [OpenRouter rankings](https://openrouter.ai/rankings), as of 2026-08-25. OpenRouter is not queried at runtime; runtime discovery calls only the configured Nous `/models` endpoint. The request carries the resolved Nous bearer credential and Harness's standard, non-secret `User-Agent` attribution header.
+
+The merge is deterministic:
+
+- configured/curated `models` remain first, in configuration order, and their name, description, context window, and output cap win over conflicting live metadata;
+- the compatible live remainder is sorted by display name, then exact model ID;
+- empty and duplicate IDs, `:batch` routes, tilde aliases such as `~latest`, expired routes, non-text-output routes, routes without text input, and entries whose explicit `supported_parameters` array lacks `tools` are omitted;
+- multimodal routes are accepted when they can consume and produce text, but this adapter advertises text input only because its serializer does not accept image content.
+
+`listModels()` and exact-model resolution share the same successful live snapshot for one hour. Each refresh is limited to five seconds and 4 MiB of response bytes. Before the first successful refresh—or when credentials are missing—the configured/curated list remains available. After a success, an expired snapshot is returned immediately while one background refresh runs. If a refresh fails, the last-good snapshot remains available and credential/catalog retries pause for one minute by default. API keys and raw catalog responses are never cached or written to disk.
+
+The Nous catalog is much larger. A model ID omitted from discovery can still be passed through unchanged by setting it explicitly; it then uses the plugin-wide context and output defaults.
 
 ### Terminal/headless: configure it directly
 
@@ -134,7 +168,30 @@ Then launch:
 dsh --profile web --patch ./nous-model.cordis.yml
 ```
 
-The adapter passes the model ID through to Nous unchanged. The model does not have to be in the plugin's small default catalog.
+The adapter passes the model ID through to Nous unchanged. The model does not have to be in the advertised catalog.
+
+## Configure model discovery
+
+The defaults are live discovery, a one-hour successful-response cache, a five-second request timeout, and a one-minute failed-refresh cooldown:
+
+```yaml
+- id: llm-nous
+  config:
+    apiKeyEnv: NOUS_API_KEY
+    baseURL: https://inference-api.nousresearch.com/v1
+    catalogMode: live
+    catalogCacheTtlMs: 3600000
+    catalogTimeoutMs: 5000
+    catalogRetryCooldownMs: 60000
+    models:
+      - id: deepseek/deepseek-v4-flash-0731
+        name: DeepSeek V4 Flash 0731
+        contextWindow: 1310720
+```
+
+`models` is the ordered curated list and the fallback used when live discovery has not succeeded. It is separate from the favorites a user pins in the picker. Supplying `models` replaces the built-in twelve-entry list. Set `catalogMode: curated` to disable `/models` requests completely and expose only this configured list. `catalogCacheTtlMs`, `catalogTimeoutMs`, and `catalogRetryCooldownMs` must be positive integer milliseconds no greater than the platform timer limit. The cooldown applies after failed initial or background refreshes, preventing repeated credential lookup and `/models` requests until it expires.
+
+A patch replaces the entire targeted config, so keep `apiKeyEnv` and `baseURL` when overriding discovery settings.
 
 ## Tune the output budget
 

@@ -106,13 +106,28 @@ Open **Settings → Models**. The Nous provider and its advertised models appear
 
 This screenshot is the upstream Harness model-settings UI; the Nous entries appear after the bundle is installed.
 
-The plugin advertises these entries by default:
+Live discovery is enabled by default. The plugin makes an authenticated `GET /models` request to the configured Nous endpoint and appends compatible live routes after these twelve curated, pinned routes in OpenRouter trailing-week usage order:
 
 ```text
 deepseek/deepseek-v4-flash-0731
-deepseek/deepseek-v4-pro-0813
-stepfun/step-3.7-flash:free
+xiaomi/mimo-v2.5
+tencent/hy3
+deepseek/deepseek-v4-flash
+openai/gpt-5.6-luna
+z-ai/glm-5.2
+google/gemini-3.7-flash
+deepseek/deepseek-v4-pro
+minimax/minimax-m3
+poolside/laguna-s-2.1:free
+anthropic/claude-opus-5
+openai/gpt-5.6-sol
 ```
+
+The ranking measures adoption by prompt-plus-completion token volume, not model quality. OpenRouter-only routes and variants absent from Nous are skipped. Source and attribution: [OpenRouter rankings](https://openrouter.ai/rankings), as of 2026-08-25. OpenRouter is not queried at runtime; live discovery calls only the configured Nous endpoint. That request uses the resolved Nous bearer credential and Harness's standard, non-secret `User-Agent` attribution header.
+
+Configured/curated models stay first in their configured order, and their metadata wins when a live row has the same ID. The dynamic remainder is sorted by display name and exact ID. Discovery omits empty or duplicate IDs, `:batch` routes, tilde aliases such as `~latest`, expired routes, non-text-output routes, routes without text input, and entries whose explicit `supported_parameters` array lacks `tools`. Multimodal text-output routes remain eligible, but this adapter advertises text input only.
+
+`listModels()` and exact-model resolution share a successful live snapshot for one hour. Refreshes are bounded to five seconds and 4 MiB. The configured list is the fallback before the first success and when credentials are missing. After a success, an expired snapshot returns immediately while one background refresh runs. A failed refresh retains the last-good snapshot and pauses credential/catalog retries for one minute by default. Neither API keys nor raw catalog responses are persisted.
 
 ### Terminal and headless runs
 
@@ -131,9 +146,30 @@ Then run:
 dsh --profile headless --patch ./nous-model.cordis.yml 'Reply with exactly: NOUS_OK'
 ```
 
-Any exact Nous model ID can be used this way, even if it is not in the small advertised catalog.
+Any exact Nous model ID can be used this way, even if it is not in the advertised catalog.
 
-## 5. Set the output budget
+## 5. Configure model discovery
+
+The discovery settings and their defaults are:
+
+```yaml
+- id: llm-nous
+  config:
+    apiKeyEnv: NOUS_API_KEY
+    baseURL: https://inference-api.nousresearch.com/v1
+    catalogMode: live
+    catalogCacheTtlMs: 3600000
+    catalogTimeoutMs: 5000
+    catalogRetryCooldownMs: 60000
+    models:
+      - id: deepseek/deepseek-v4-flash-0731
+        name: DeepSeek V4 Flash 0731
+        contextWindow: 1310720
+```
+
+`models` is the ordered pinned catalog and the pre-success fallback. Supplying it replaces the built-in twelve entries. Set `catalogMode: curated` to make discovery fully static and skip `/models` requests. TTL, timeout, and failed-refresh cooldown values are positive integer milliseconds, bounded by the platform timer limit. During the cooldown, discovery does not repeat credential lookup or `/models` requests. Because a patch replaces the whole `llm-nous` config, keep `apiKeyEnv` and `baseURL` when changing these settings.
+
+## 6. Set the output budget
 
 `maxTokens` limits how many tokens the model may generate in one response. It includes visible output, reasoning, and model-generated tool calls. It does not define conversation memory; that is the model's context window.
 
@@ -177,7 +213,7 @@ explicit request maxTokens
 
 Keep the output cap below the selected model's total context window after accounting for conversation history, system instructions, and tool definitions.
 
-## 6. Verify the installation
+## 7. Verify the installation
 
 Inspect the composed profile without starting the agent:
 

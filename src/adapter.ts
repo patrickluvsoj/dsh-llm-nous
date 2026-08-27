@@ -40,6 +40,9 @@ export interface NousCatalogModel {
   maxTokens?: number
 }
 
+/** Whether discovery reads Nous live or stays entirely on configured/curated entries. */
+export type NousCatalogMode = 'live' | 'curated'
+
 /**
  * Validated connection facts for one operation. The plugin's
  * `resolveAdapterOptions` is the one explicit resolve step producing this
@@ -64,6 +67,14 @@ export interface NousConnectionOptions {
   defaultContextWindow: number
   /** Advisory models exposed to discovery consumers; requests remain unrestricted. */
   models: readonly NousCatalogModel[]
+  /** Catalog source policy; live discovery is the default. */
+  catalogMode: NousCatalogMode
+  /** Successful live-catalog cache lifetime. */
+  catalogCacheTtlMs: number
+  /** Wall-clock bound for one live-catalog refresh, including credential lookup. */
+  catalogTimeoutMs: number
+  /** Delay before retrying a failed live-catalog refresh. */
+  catalogRetryCooldownMs: number
   /** Maximum provider idle time while one stream read is outstanding. */
   streamIdleTimeoutMs: number
   /** Provider-owned model-request retry policy, already resolved. */
@@ -83,6 +94,10 @@ export interface NousAdapterOptions {
   resolveApiKey: (connection: NousConnectionOptions) => Promise<string>
   /** Resolve the harness-home anonymous id shared with telemetry and feedback. */
   resolveUserId: () => AnonymousUserId
+  /** Injectable transport seam for deterministic catalog tests. */
+  fetch?: typeof globalThis.fetch
+  /** Injectable clock seam for deterministic cache tests. */
+  now?: () => number
 }
 
 /** Default maximum idle interval while an adapter stream read is outstanding. */
@@ -93,6 +108,14 @@ export const DEFAULT_CONTEXT_WINDOW = 1_000_000
 // Generic Nous models vary widely; 256k is unsafe because many catalog
 // entries expose a 256k total context window and Harness adds tool schemas.
 export const DEFAULT_MAX_TOKENS = 8_192
+/** Default lifetime of one successful live model-catalog response. */
+export const DEFAULT_CATALOG_CACHE_TTL_MS = 3_600_000
+/** Default wall-clock bound for one live model-catalog request. */
+export const DEFAULT_CATALOG_TIMEOUT_MS = 5_000
+/** Default delay before retrying a failed live model-catalog refresh. */
+export const DEFAULT_CATALOG_RETRY_COOLDOWN_MS = 60_000
+/** Maximum accepted live model-catalog response size, measured from body bytes. */
+export const MAX_CATALOG_RESPONSE_BYTES = 4 * 1024 * 1024
 const STREAM_IDLE_TIMEOUT_CODE = 'LLM_STREAM_IDLE_TIMEOUT'
 const OFF_REASONING_EFFORT = ReasoningEffortId('off')
 const HIGH_REASONING_EFFORT = ReasoningEffortId('high')
@@ -111,6 +134,184 @@ function modelInfo(provider: string, model: NousCatalogModel): LlmModelInfo {
     ...model.description === undefined ? {} : { description: model.description },
     inputModalities: ['text'],
   }
+}
+
+interface CatalogCacheEntry {
+  models?: readonly NousCatalogModel[]
+  refreshedAt?: number
+  retryAfter?: number
+  inflight?: Promise<readonly NousCatalogModel[]>
+}
+
+function catalogEndpoint(baseURL: string): string {
+  return `${baseURL.replace(/\/+$/, '')}/models`
+}
+
+function catalogCacheKey(connection: NousConnectionOptions): string {
+  // The credential reference identifies the effective authorization plane
+  // without retaining the resolved secret. Configured models are merged after
+  // lookup, so they do not affect the identity of the discovered snapshot.
+  return JSON.stringify([catalogEndpoint(connection.baseURL), String(connection.apiKeyEnv)])
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === 'object' && value !== null && !Array.isArray(value)
+}
+
+function positiveInteger(...values: unknown[]): number | undefined {
+  return values.find((value): value is number => Number.isSafeInteger(value) && (value as number) > 0)
+}
+
+function stringArray(value: unknown): readonly string[] | undefined {
+  return Array.isArray(value) && value.every(entry => typeof entry === 'string')
+    ? value
+    : undefined
+}
+
+function modalities(row: Record<string, unknown>, field: 'input_modalities' | 'output_modalities'): readonly string[] | undefined {
+  const direct = stringArray(row[field])
+  if (direct !== undefined) return direct
+  return isRecord(row.architecture) ? stringArray(row.architecture[field]) : undefined
+}
+
+function isExpired(row: Record<string, unknown>, now: number): boolean {
+  if (row.expired === true) return true
+  const candidate = row.expiration_date ?? row.expires_at ?? row.expiration
+  if (candidate === undefined || candidate === null) return false
+  if (typeof candidate === 'number' && Number.isFinite(candidate) && candidate > 0) {
+    const milliseconds = candidate < 1_000_000_000_000 ? candidate * 1_000 : candidate
+    return milliseconds <= now
+  }
+  if (typeof candidate === 'string') {
+    const milliseconds = Date.parse(candidate)
+    return !Number.isFinite(milliseconds) || milliseconds <= now
+  }
+  return true
+}
+
+function normalizeCatalogRow(row: unknown, now: number): NousCatalogModel | undefined {
+  if (!isRecord(row) || typeof row.id !== 'string') return undefined
+  const id = row.id.trim()
+  if (id.length === 0 || id.includes('~') || id.endsWith(':batch') || isExpired(row, now)) return undefined
+
+  const inputs = modalities(row, 'input_modalities')
+  if (inputs !== undefined && !inputs.includes('text')) return undefined
+  const outputs = modalities(row, 'output_modalities')
+  if (outputs !== undefined && !outputs.includes('text')) return undefined
+  if (Array.isArray(row.supported_parameters) && !row.supported_parameters.includes('tools')) return undefined
+
+  const name = typeof row.name === 'string' && row.name.trim().length > 0
+    ? row.name.trim()
+    : undefined
+  const description = typeof row.description === 'string' && row.description.trim().length > 0
+    ? row.description.trim()
+    : undefined
+  const contextWindow = positiveInteger(row.context_length, row.context_window)
+  const topProvider = isRecord(row.top_provider) ? row.top_provider : undefined
+  const maxTokens = positiveInteger(
+    row.max_output_tokens,
+    row.max_completion_tokens,
+    row.output_token_limit,
+    row.max_tokens,
+    topProvider?.max_completion_tokens,
+  )
+  return {
+    id,
+    ...name === undefined ? {} : { name },
+    ...description === undefined ? {} : { description },
+    ...contextWindow === undefined ? {} : { contextWindow },
+    ...maxTokens === undefined ? {} : { maxTokens },
+  }
+}
+
+function compareCatalogModels(left: NousCatalogModel, right: NousCatalogModel): number {
+  const leftName = left.name ?? left.id
+  const rightName = right.name ?? right.id
+  if (leftName < rightName) return -1
+  if (leftName > rightName) return 1
+  if (left.id < right.id) return -1
+  if (left.id > right.id) return 1
+  return 0
+}
+
+function mergeCatalog(
+  configured: readonly NousCatalogModel[],
+  discovered: readonly NousCatalogModel[],
+): NousCatalogModel[] {
+  const discoveredById = new Map(discovered.map(model => [model.id, model]))
+  const preferred = configured.map((model) => {
+    const live = discoveredById.get(model.id)
+    discoveredById.delete(model.id)
+    return live === undefined ? model : { ...live, ...model }
+  })
+  return [...preferred, ...[...discoveredById.values()].sort(compareCatalogModels)]
+}
+
+class CatalogWaitAborted {
+  constructor(readonly reason: unknown) {}
+}
+
+function waitForCatalog<T>(promise: Promise<T>, signal?: AbortSignal): Promise<T> {
+  if (signal === undefined) return promise
+  if (signal.aborted) return Promise.reject(new CatalogWaitAborted(signal.reason))
+  return new Promise<T>((resolve, reject) => {
+    const onAbort = (): void => { reject(new CatalogWaitAborted(signal.reason)) }
+    signal.addEventListener('abort', onAbort, { once: true })
+    void promise.then(resolve, reject).finally(() => {
+      signal.removeEventListener('abort', onAbort)
+    })
+  })
+}
+
+function waitForSignal<T>(promise: Promise<T>, signal: AbortSignal): Promise<T> {
+  if (signal.aborted) return Promise.reject(signal.reason)
+  return new Promise<T>((resolve, reject) => {
+    const onAbort = (): void => { reject(signal.reason) }
+    signal.addEventListener('abort', onAbort, { once: true })
+    void promise.then(resolve, reject).finally(() => {
+      signal.removeEventListener('abort', onAbort)
+    })
+  })
+}
+
+async function readBoundedJson(response: Response): Promise<unknown> {
+  if (!response.ok) {
+    try {
+      await response.body?.cancel()
+    } catch {
+      // HTTP status is the catalog outcome; cancellation is best-effort transport cleanup.
+    }
+    throw new Error(`Nous model catalog returned HTTP ${response.status}`)
+  }
+  if (response.body === null) throw new Error('Nous model catalog returned no response body')
+  const reader = response.body.getReader()
+  const chunks: Uint8Array[] = []
+  let total = 0
+  try {
+    while (true) {
+      const result = await reader.read()
+      if (result.done) break
+      total += result.value.byteLength
+      if (total > MAX_CATALOG_RESPONSE_BYTES) {
+        try {
+          await reader.cancel()
+        } catch {
+          // The size violation is the catalog outcome; cancellation is best-effort transport cleanup.
+        }
+        throw new Error(`Nous model catalog exceeded ${MAX_CATALOG_RESPONSE_BYTES} bytes`)
+      }
+      chunks.push(result.value)
+    }
+  } finally {
+    reader.releaseLock()
+  }
+  const bytes = new Uint8Array(total)
+  let offset = 0
+  for (const chunk of chunks) {
+    bytes.set(chunk, offset)
+    offset += chunk.byteLength
+  }
+  return JSON.parse(new TextDecoder('utf-8', { fatal: true }).decode(bytes)) as unknown
 }
 
 function providerRetryAfterMs(value: string | null): number | undefined {
@@ -155,8 +356,14 @@ export function httpErrorCode(status: number, error?: WireError['error']): strin
  * map to `ABORTED`; the configured per-read idle watchdog maps to `TIMEOUT`.
  */
 export class NousAdapter extends LlmAdapter {
+  private readonly catalogCache = new Map<string, CatalogCacheEntry>()
+  private readonly catalogFetch: typeof globalThis.fetch
+  private readonly now: () => number
+
   constructor(private readonly config: NousAdapterOptions) {
     super()
+    this.catalogFetch = config.fetch ?? globalThis.fetch
+    this.now = config.now ?? Date.now
   }
 
   override providerInfo(provider: string): LlmProviderInfo {
@@ -167,20 +374,23 @@ export class NousAdapter extends LlmAdapter {
     return this.config.options().retryPolicy
   }
 
-  override listModels(provider: string): Promise<readonly LlmModelInfo[]> {
-    return Promise.resolve(this.config.options().models.map(model => modelInfo(provider, model)))
+  override async listModels(provider: string): Promise<readonly LlmModelInfo[]> {
+    const connection = this.config.options()
+    const models = await this.resolveCatalog(connection)
+    return models.map(model => modelInfo(provider, model))
   }
 
-  override resolveModel(
+  override async resolveModel(
     provider: string,
     model: string,
-    _signal?: AbortSignal,
+    signal?: AbortSignal,
   ): Promise<LlmResolvedModelInfo> {
     const connection = this.config.options()
-    const configured = connection.models.find(entry => entry.id === model)
+    const catalog = await this.resolveCatalog(connection, signal)
+    const configured = catalog.find(entry => entry.id === model)
     const contextWindow = configured?.contextWindow
       ?? connection.defaultContextWindow
-    return Promise.resolve({
+    return {
       // The chat-completions wire route is text-only regardless of catalog
       // membership, so the uncatalogued fallback declares the same negative
       // capability — "unknown" here would let the host accept and persist
@@ -198,7 +408,113 @@ export class NousAdapter extends LlmAdapter {
             ? MAX_REASONING_EFFORT
             : HIGH_REASONING_EFFORT,
         },
+    }
+  }
+
+  private async resolveCatalog(
+    connection: NousConnectionOptions,
+    signal?: AbortSignal,
+  ): Promise<readonly NousCatalogModel[]> {
+    if (connection.catalogMode === 'curated') return connection.models
+    const key = catalogCacheKey(connection)
+    let cache = this.catalogCache.get(key)
+    if (cache === undefined) {
+      cache = {}
+      this.catalogCache.set(key, cache)
+    }
+    const now = this.now()
+    if (cache.models !== undefined
+      && cache.refreshedAt !== undefined
+      && now - cache.refreshedAt < connection.catalogCacheTtlMs) {
+      return mergeCatalog(connection.models, cache.models)
+    }
+
+    const coolingDown = cache.retryAfter !== undefined && now < cache.retryAfter
+    if (cache.models !== undefined) {
+      // Stale-while-revalidate: discovery must never block model selection once
+      // there is a complete last-good snapshot. The shared refresh owns its
+      // timeout and rejection handling independently of this caller.
+      if (cache.inflight === undefined && !coolingDown) {
+        this.startCatalogRefresh(connection, cache)
+      }
+      return mergeCatalog(connection.models, cache.models)
+    }
+
+    // Before the first success, retain the curated fallback and avoid repeated
+    // credential or transport work while the last failure is cooling down.
+    if (cache.inflight === undefined && coolingDown) return connection.models
+
+    const refresh = cache.inflight ?? this.startCatalogRefresh(connection, cache)
+    try {
+      const discovered = await waitForCatalog(refresh, signal)
+      return mergeCatalog(connection.models, discovered)
+    } catch (error: unknown) {
+      if (error instanceof CatalogWaitAborted) throw error.reason
+      // Discovery is advisory. Preserve the last complete success, or the
+      // configured/curated fallback before any success, without exposing keys,
+      // response bodies, or transport details through discovery consumers.
+      return mergeCatalog(connection.models, cache.models ?? [])
+    }
+  }
+
+  private startCatalogRefresh(
+    connection: NousConnectionOptions,
+    cache: CatalogCacheEntry,
+  ): Promise<readonly NousCatalogModel[]> {
+    if (cache.inflight !== undefined) return cache.inflight
+    const refresh = this.fetchCatalog(connection).then(
+      (discovered) => {
+        cache.models = discovered
+        cache.refreshedAt = this.now()
+        delete cache.retryAfter
+        return discovered
+      },
+      (error: unknown) => {
+        cache.retryAfter = this.now() + connection.catalogRetryCooldownMs
+        throw error
+      },
+    )
+    cache.inflight = refresh
+    // Always observe background rejection and release the single-flight slot.
+    void refresh.then(
+      () => {
+        if (cache.inflight === refresh) delete cache.inflight
+      },
+      () => {
+        if (cache.inflight === refresh) delete cache.inflight
+      },
+    )
+    return refresh
+  }
+
+  private async fetchCatalog(
+    connection: NousConnectionOptions,
+  ): Promise<readonly NousCatalogModel[]> {
+    const signal = AbortSignal.timeout(connection.catalogTimeoutMs)
+    const apiKey = await waitForSignal(this.config.resolveApiKey(connection), signal)
+    const response = await this.catalogFetch(catalogEndpoint(connection.baseURL), {
+      method: 'GET',
+      headers: {
+        'authorization': `Bearer ${apiKey}`,
+        'accept': 'application/json',
+        ...attributionHeaders(),
+      },
+      signal,
     })
+    const parsed = await readBoundedJson(response)
+    if (!isRecord(parsed) || !Array.isArray(parsed.data)) {
+      throw new Error('Nous model catalog must be an object with a data array')
+    }
+    const seen = new Set<string>()
+    const models: NousCatalogModel[] = []
+    const now = this.now()
+    for (const row of parsed.data) {
+      const model = normalizeCatalogRow(row, now)
+      if (model === undefined || seen.has(model.id)) continue
+      seen.add(model.id)
+      models.push(model)
+    }
+    return models
   }
 
   async * stream(options: GenerateOptions): AsyncIterable<StreamChunk> {

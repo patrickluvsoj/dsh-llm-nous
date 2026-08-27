@@ -21,6 +21,9 @@ import { deepEqualJson, installSettingsSection, settingsNamespace } from '@deeps
 import { MAX_TIMER_DELAY_MS } from '@deepseek-ai/dsh-timeout'
 import { getOrCreateAnonymousUserId, type AnonymousUserId } from '@deepseek-ai/dsh-anonymous-user-id'
 import {
+  DEFAULT_CATALOG_CACHE_TTL_MS,
+  DEFAULT_CATALOG_RETRY_COOLDOWN_MS,
+  DEFAULT_CATALOG_TIMEOUT_MS,
   DEFAULT_CONTEXT_WINDOW,
   DEFAULT_MAX_TOKENS,
   DEFAULT_STREAM_IDLE_TIMEOUT_MS,
@@ -29,12 +32,15 @@ import {
 import type { NousCatalogModel, NousConnectionOptions } from './adapter.ts'
 
 export {
+  DEFAULT_CATALOG_CACHE_TTL_MS,
+  DEFAULT_CATALOG_RETRY_COOLDOWN_MS,
+  DEFAULT_CATALOG_TIMEOUT_MS,
   DEFAULT_CONTEXT_WINDOW,
   DEFAULT_MAX_TOKENS,
   DEFAULT_STREAM_IDLE_TIMEOUT_MS,
   NousAdapter,
 } from './adapter.ts'
-export type { NousAdapterOptions, NousCatalogModel, NousConnectionOptions } from './adapter.ts'
+export type { NousAdapterOptions, NousCatalogMode, NousCatalogModel, NousConnectionOptions } from './adapter.ts'
 export type { RequestDefaults } from './serialize.ts'
 export type * from './types.ts'
 
@@ -46,10 +52,21 @@ const DEFAULT_API_KEY_ENV = 'NOUS_API_KEY'
 /** The single provider route this plugin owns. */
 const PROVIDER = 'nous'
 
+// Exact Nous routes ordered by OpenRouter trailing-week token usage through
+// 2026-08-25. OpenRouter-only variants and routes absent from Nous are omitted.
 const DEFAULT_MODELS: NousCatalogModel[] = [
-  { id: 'deepseek/deepseek-v4-flash-0731', name: 'Nous Portal V4 Flash (Nous)', contextWindow: 1048576 },
-  { id: 'deepseek/deepseek-v4-pro-0813', name: 'Nous Portal V4 Pro (Nous)', contextWindow: 1048576 },
-  { id: 'stepfun/step-3.7-flash:free', name: 'Step 3.7 Flash (Free)', contextWindow: 256000 },
+  { id: 'deepseek/deepseek-v4-flash-0731', name: 'DeepSeek V4 Flash 0731', contextWindow: 1_310_720 },
+  { id: 'xiaomi/mimo-v2.5', name: 'MiMo-V2.5', contextWindow: 1_050_000 },
+  { id: 'tencent/hy3', name: 'Hy3', contextWindow: 262_144 },
+  { id: 'deepseek/deepseek-v4-flash', name: 'DeepSeek V4 Flash 0423', contextWindow: 1_048_576 },
+  { id: 'openai/gpt-5.6-luna', name: 'GPT-5.6 Luna', contextWindow: 1_050_000 },
+  { id: 'z-ai/glm-5.2', name: 'GLM 5.2', contextWindow: 1_048_576 },
+  { id: 'google/gemini-3.7-flash', name: 'Gemini 3.7 Flash', contextWindow: 1_048_576 },
+  { id: 'deepseek/deepseek-v4-pro', name: 'DeepSeek V4 Pro 0423', contextWindow: 1_048_576 },
+  { id: 'minimax/minimax-m3', name: 'MiniMax M3', contextWindow: 1_048_576 },
+  { id: 'poolside/laguna-s-2.1:free', name: 'Laguna S 2.1 (Free)', contextWindow: 262_144 },
+  { id: 'anthropic/claude-opus-5', name: 'Claude Opus 5', contextWindow: 1_000_000 },
+  { id: 'openai/gpt-5.6-sol', name: 'GPT-5.6 Sol', contextWindow: 1_050_000 },
 ]
 
 /**
@@ -71,8 +88,16 @@ export interface Config {
   maxTokens?: number
   /** Positive context capacity used when the selected model has no exact value (default 1,000,000). */
   defaultContextWindow?: number
-  /** Advisory models shown by discovery consumers; defaults to V4 Flash and V4 Pro. */
+  /** Advisory models shown by discovery consumers; defaults to a usage-ranked curated catalog. */
   models?: NousCatalogModel[]
+  /** Use live Nous discovery or only configured/curated entries (default live). */
+  catalogMode?: 'live' | 'curated'
+  /** Successful live-catalog cache lifetime in milliseconds (default one hour). */
+  catalogCacheTtlMs?: number
+  /** Wall-clock bound for one live-catalog refresh, including credential lookup (default five seconds). */
+  catalogTimeoutMs?: number
+  /** Delay before retrying a failed live-catalog refresh (default one minute). */
+  catalogRetryCooldownMs?: number
   /** Maximum provider idle time while one stream read is outstanding (default five minutes). */
   streamIdleTimeoutMs?: number
   /** Provider-owned model-request retry policy; omission uses normal defaults. */
@@ -94,6 +119,10 @@ export const Config: z<Config> = z.object({
   maxTokens: z.number().step(1).min(1).max(Number.MAX_SAFE_INTEGER).default(DEFAULT_MAX_TOKENS),
   defaultContextWindow: z.number().step(1).min(1).default(DEFAULT_CONTEXT_WINDOW),
   models: z.array(catalogModel).default(DEFAULT_MODELS),
+  catalogMode: z.union(['live', 'curated']).default('live'),
+  catalogCacheTtlMs: z.number().step(1).min(1).max(MAX_TIMER_DELAY_MS).default(DEFAULT_CATALOG_CACHE_TTL_MS),
+  catalogTimeoutMs: z.number().step(1).min(1).max(MAX_TIMER_DELAY_MS).default(DEFAULT_CATALOG_TIMEOUT_MS),
+  catalogRetryCooldownMs: z.number().step(1).min(1).max(MAX_TIMER_DELAY_MS).default(DEFAULT_CATALOG_RETRY_COOLDOWN_MS),
   streamIdleTimeoutMs: z.number().min(Number.MIN_VALUE).max(MAX_TIMER_DELAY_MS).default(DEFAULT_STREAM_IDLE_TIMEOUT_MS),
   retryPolicy: RetryPolicySchema,
 })
@@ -165,6 +194,34 @@ export function resolveAdapterOptions(config: Config, environment?: LaunchEnviro
     && (!Number.isSafeInteger(config.maxTokens) || config.maxTokens <= 0)) {
     throw new Error('llm-nous: maxTokens must be a positive safe integer')
   }
+  const catalogMode = config.catalogMode ?? 'live'
+  if (catalogMode !== 'live' && catalogMode !== 'curated') {
+    throw new Error('llm-nous: catalogMode must be "live" or "curated"')
+  }
+  const catalogCacheTtlMs = config.catalogCacheTtlMs ?? DEFAULT_CATALOG_CACHE_TTL_MS
+  if (!Number.isSafeInteger(catalogCacheTtlMs)
+    || catalogCacheTtlMs <= 0
+    || catalogCacheTtlMs > MAX_TIMER_DELAY_MS) {
+    throw new Error(
+      `llm-nous: catalogCacheTtlMs must be a positive safe integer no greater than ${MAX_TIMER_DELAY_MS}`,
+    )
+  }
+  const catalogTimeoutMs = config.catalogTimeoutMs ?? DEFAULT_CATALOG_TIMEOUT_MS
+  if (!Number.isSafeInteger(catalogTimeoutMs)
+    || catalogTimeoutMs <= 0
+    || catalogTimeoutMs > MAX_TIMER_DELAY_MS) {
+    throw new Error(
+      `llm-nous: catalogTimeoutMs must be a positive safe integer no greater than ${MAX_TIMER_DELAY_MS}`,
+    )
+  }
+  const catalogRetryCooldownMs = config.catalogRetryCooldownMs ?? DEFAULT_CATALOG_RETRY_COOLDOWN_MS
+  if (!Number.isSafeInteger(catalogRetryCooldownMs)
+    || catalogRetryCooldownMs <= 0
+    || catalogRetryCooldownMs > MAX_TIMER_DELAY_MS) {
+    throw new Error(
+      `llm-nous: catalogRetryCooldownMs must be a positive safe integer no greater than ${MAX_TIMER_DELAY_MS}`,
+    )
+  }
   const streamIdleTimeoutMs = config.streamIdleTimeoutMs ?? DEFAULT_STREAM_IDLE_TIMEOUT_MS
   if (!Number.isFinite(streamIdleTimeoutMs)
     || streamIdleTimeoutMs <= 0
@@ -182,6 +239,10 @@ export function resolveAdapterOptions(config: Config, environment?: LaunchEnviro
     maxTokens: config.maxTokens ?? DEFAULT_MAX_TOKENS,
     defaultContextWindow: config.defaultContextWindow ?? DEFAULT_CONTEXT_WINDOW,
     models: resolveModels(config.models),
+    catalogMode,
+    catalogCacheTtlMs,
+    catalogTimeoutMs,
+    catalogRetryCooldownMs,
     streamIdleTimeoutMs,
     retryPolicy: resolveRetryPolicy(config.retryPolicy, 'llm-nous: retryPolicy'),
   }
