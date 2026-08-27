@@ -83,8 +83,6 @@ poolside/laguna-s-2.1:free
 
 Harness exposes configured providers in **Settings → Models**. After `dsh-llm-nous` is loaded, the Nous provider and its advertised models can appear in the model picker.
 
-![Harness model settings page](docs/assets/providers-models-page.png)
-
 *This is the upstream Harness model-settings UI; the Nous card/model entries appear after the Nous bundle is installed.*
 
 Select a model in the picker and it becomes the default for **new sessions**. A session that has already sent a request keeps the provider/model recorded in its own log. Model changes apply on the next request; no server restart is needed for an ordinary selection change.
